@@ -1,0 +1,17 @@
+{
+  "name": "kuma-ploi-bridge",
+  "version": "1.0.0",
+  "description": "Minimal REST bridge in front of Uptime Kuma's Socket.IO API, so plain HTTP tools (n8n, curl) can list and create monitors.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io-client": "^4.7.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
