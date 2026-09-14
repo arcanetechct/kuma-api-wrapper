@@ -123,7 +123,9 @@ function buildMonitorBean(input) {
     maxretries: input.maxretries != null ? input.maxretries : 3,
     upsideDown: false,
     notificationIDList: DEFAULT_NOTIFICATION_ID ? { [DEFAULT_NOTIFICATION_ID]: true } : {},
-    description: input.description || null
+    description: input.description || null,
+    conditions: [],
+
   };
 
   if (type === 'http') {
