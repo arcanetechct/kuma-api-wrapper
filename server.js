@@ -24,6 +24,23 @@
  *                                             flag deleteChildren=true also deletes
  *                                             every monitor nested under it (only
  *                                             meaningful for a "group" monitor).
+ *   PATCH  /monitors/:id                  -> update one or more fields on an
+ *                                             EXISTING monitor (e.g. { "parent": 90 }
+ *                                             to move it into a group, or
+ *                                             { "parent": null } to un-nest it).
+ *                                             Kuma's underlying "editMonitor" socket
+ *                                             event does NOT merge -- it assigns
+ *                                             every field it knows about straight
+ *                                             onto the DB row, so a partial payload
+ *                                             sent directly would silently null out
+ *                                             everything you didn't include
+ *                                             (retryInterval, notificationIDList,
+ *                                             etc). This endpoint protects against
+ *                                             that: it fetches the monitor's full
+ *                                             current state via "getMonitor" first,
+ *                                             layers your requested fields on top,
+ *                                             then sends the complete object back
+ *                                             through "editMonitor".
  *   GET    /tags                          -> [{ id, name, color }, ...]
  *   POST   /tags                          -> create a tag. Body: { name, color }.
  *                                             color is a hex string; defaults to
@@ -315,6 +332,39 @@ app.delete('/monitors/:id', (req, res) => {
     } else {
       res.status(422).json({ ok: false, error: (result && result.msg) || 'Kuma rejected the delete (no message given).' });
     }
+  });
+});
+
+app.patch('/monitors/:id', (req, res) => {
+  if (!loggedIn) {
+    return res.status(503).json({ ok: false, error: 'Not logged in to Kuma yet. Check /health and container logs.' });
+  }
+
+  const monitorID = Number(req.params.id);
+  if (!Number.isInteger(monitorID)) {
+    return res.status(400).json({ ok: false, error: '"id" must be a numeric monitor ID.' });
+  }
+
+  const patch = req.body || {};
+
+  // "editMonitor" requires a COMPLETE monitor object -- see the header comment
+  // above for why. Fetch the current full state first via "getMonitor", then
+  // layer only the requested field(s) on top before sending the whole thing
+  // back through "editMonitor".
+  socket.emit('getMonitor', monitorID, (getResult) => {
+    if (!getResult || !getResult.ok) {
+      return res.status(404).json({ ok: false, error: (getResult && getResult.msg) || 'Monitor not found.' });
+    }
+
+    const merged = Object.assign({}, getResult.monitor, patch, { id: monitorID });
+
+    socket.emit('editMonitor', merged, (editResult) => {
+      if (editResult && editResult.ok) {
+        res.json({ ok: true, monitorID: editResult.monitorID, msg: editResult.msg });
+      } else {
+        res.status(422).json({ ok: false, error: (editResult && editResult.msg) || 'Kuma rejected the edit (no message given).' });
+      }
+    });
   });
 });
 
