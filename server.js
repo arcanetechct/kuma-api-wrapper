@@ -101,6 +101,11 @@ socket.on('monitorList', (list) => {
   monitorListCache = list || {};
 });
 
+// After the existing socket.on('monitorList', ...) handler:
+socket.on('updateMonitorIntoList', (list) => {
+  Object.assign(monitorListCache, list);
+});
+
 // ---------------------------------------------------------------------------
 // Monitor bean builder
 // ---------------------------------------------------------------------------
