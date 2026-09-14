@@ -16,13 +16,19 @@ Currently supported:
 - Bearer token authentication
 - Docker support
 
-## API Endpoints
+## Available Endpoints
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/health` | Check API and Uptime Kuma connection status |
-| `GET` | `/monitors` | List monitors |
-| `POST` | `/monitors` | Create a monitor |
+| `GET` | `/health` | Returns connection status: `{ ok, connected, loggedIn }` |
+| `GET` | `/monitors` | Returns monitors including fields such as `id`, `name`, `type`, `url`, `hostname`, `port`, `parent`, and `tags`. |
+| `POST` | `/monitors` | Create a monitor. See `buildMonitorBean()` for accepted fields, including `type: "group"` and `parent` for nested monitors. |
+| `DELETE` | `/monitors/:id` | Delete a monitor. Optional `deleteChildren=true` query/body flag also deletes monitors nested under it. |
+| `GET` | `/tags` | Returns tags as `{ id, name, color }`. |
+| `POST` | `/tags` | Create a tag. Body: `{ name, color }`. `color` defaults to `#00A5C0` if omitted. |
+| `POST` | `/monitors/:id/tags` | Attach an existing tag to a monitor. Body: `{ tagID, value }`. `value` is optional. |
+| `DELETE` | `/monitors/:id/tags/:tagID` | Detach a tag from a monitor. Optional `value` query/body field narrows which tag/value pairing is removed. |
+
 
 All API requests require an authorization header:
 

@@ -7,15 +7,45 @@
  * Uptime Kuma has no official REST API for creating/listing monitors (as of the
  * versions current in 2026) -- monitor management only happens over Socket.IO,
  * the same channel the Kuma web UI uses. This service logs into Kuma once (like
- * a browser tab would), keeps that connection alive, and exposes two small,
+ * a browser tab would), keeps that connection alive, and exposes small,
  * well-defined HTTP endpoints on top of it so n8n (or curl, or anything else)
  * can talk to Kuma with plain HTTP instead of speaking Socket.IO itself.
  *
  * ENDPOINTS
- *   GET  /health              -> { ok, connected, loggedIn }
- *   GET  /monitors             -> [{ id, name, type, url, hostname, port, ... }, ...]
- *   POST /monitors             -> create a monitor. See buildMonitorBean() below
- *                                  for exactly what fields are accepted.
+ *   GET    /health                       -> { ok, connected, loggedIn }
+ *   GET    /monitors                      -> [{ id, name, type, url, hostname, port,
+ *                                              parent, tags, ... }, ...]
+ *   POST   /monitors                      -> create a monitor. See buildMonitorBean()
+ *                                             below for exactly what fields are
+ *                                             accepted, including "group" (a Kuma
+ *                                             Monitor Group) and "parent" (the id of
+ *                                             a group monitor to nest this one under).
+ *   DELETE /monitors/:id                  -> delete a monitor. Optional query/body
+ *                                             flag deleteChildren=true also deletes
+ *                                             every monitor nested under it (only
+ *                                             meaningful for a "group" monitor).
+ *   GET    /tags                          -> [{ id, name, color }, ...]
+ *   POST   /tags                          -> create a tag. Body: { name, color }.
+ *                                             color is a hex string; defaults to
+ *                                             Kuma's teal (#00A5C0) if omitted.
+ *   POST   /monitors/:id/tags             -> attach an existing tag to a monitor.
+ *                                             Body: { tagID, value }. value is
+ *                                             optional free text Kuma stores
+ *                                             alongside the tag on that monitor.
+ *   DELETE /monitors/:id/tags/:tagID      -> detach a tag from a monitor. Optional
+ *                                             query/body "value" narrows which
+ *                                             tag+value pairing to remove.
+ *
+ * A NOTE ON THE MONITOR CACHE (read this before debugging "monitor already exists"
+ * or "duplicate monitor" bugs)
+ * Kuma pushes its monitor list over two different, unrelated socket events:
+ *   - "monitorList": a full snapshot, sent ONLY once, right when a socket logs in.
+ *   - "updateMonitorIntoList": a one-monitor delta, sent every time a monitor is
+ *     added or edited afterward.
+ * This bridge listens for both and merges deltas into the same in-memory cache.
+ * Miss either listener and the cache silently goes stale the moment anything
+ * changes after login -- which is exactly what caused duplicate monitors to keep
+ * getting created before "updateMonitorIntoList" was added here.
  *
  * AUTH
  * Every request must include:  Authorization: Bearer <BRIDGE_API_KEY>
@@ -61,7 +91,7 @@ if (!KUMA_URL || !KUMA_USERNAME || !KUMA_PASSWORD || !BRIDGE_API_KEY) {
 // ---------------------------------------------------------------------------
 
 let loggedIn = false;
-let monitorListCache = {}; // Kuma pushes this whole object after login and on every change
+let monitorListCache = {}; // populated by 'monitorList' at login, kept live by 'updateMonitorIntoList' after that
 
 const socket = io(KUMA_URL, {
   transports: ['websocket', 'polling'],
@@ -95,15 +125,17 @@ socket.on('connect_error', (err) => {
   console.error('[kuma-ploi-bridge] Socket connect error:', err.message);
 });
 
-// Kuma pushes the full monitor list (keyed by id) after login, and again
-// whenever a monitor is added/edited/deleted elsewhere (e.g. in the Kuma UI).
+// Kuma pushes the full monitor list (keyed by id) once, right after login.
 socket.on('monitorList', (list) => {
   monitorListCache = list || {};
 });
 
-// After the existing socket.on('monitorList', ...) handler:
+// Every add/edit AFTER that initial login comes through as a one-monitor delta
+// on this separate event instead -- merge it in, or the cache goes stale the
+// moment anything changes (this was the root cause of the duplicate-monitor
+// bug: dedup was silently comparing against a cache frozen at login time).
 socket.on('updateMonitorIntoList', (list) => {
-  Object.assign(monitorListCache, list);
+  Object.assign(monitorListCache, list || {});
 });
 
 // ---------------------------------------------------------------------------
@@ -129,9 +161,37 @@ function buildMonitorBean(input) {
     upsideDown: false,
     notificationIDList: DEFAULT_NOTIFICATION_ID ? { [DEFAULT_NOTIFICATION_ID]: true } : {},
     description: input.description || null,
+    // Newer Kuma versions run validation/derivation logic that calls
+    // `.every()` (and similar array methods) directly on `conditions` --
+    // omitting the field entirely causes "Cannot read properties of
+    // undefined (reading 'every')". Kuma expects the field to exist even
+    // when there are no conditions configured.
     conditions: [],
+    // Kuma's "add" handler unconditionally runs
+    // `monitor.accepted_statuscodes.every(...)` regardless of monitor type
+    // -- even for ping/port monitors where it's meaningless. Must be
+    // present on every bean or this throws "Cannot read properties of
+    // undefined (reading 'every')". The http branch below overrides this
+    // with the real value.
     accepted_statuscodes: [],
   };
+
+  // Nest this monitor under a Kuma Monitor Group (a monitor with type "group").
+  // Optional -- omit entirely to leave a monitor at the top level. Kuma's own
+  // "add" handler copies whatever fields are on the object straight onto the
+  // bean (bean.import(monitor)), so unlike accepted_statuscodes/conditions
+  // above, it's fine to leave this out rather than always setting it -- there's
+  // no unconditional validation elsewhere that requires it to exist.
+  if (input.parent !== undefined && input.parent !== null) {
+    base.parent = input.parent;
+  }
+
+  if (type === 'group') {
+    // A Monitor Group is just a name and a type -- it exists purely as a
+    // container other monitors nest under via their own "parent" field. No
+    // url/hostname/port of its own.
+    return base;
+  }
 
   if (type === 'http') {
     return Object.assign(base, {
@@ -160,7 +220,7 @@ function buildMonitorBean(input) {
     });
   }
 
-  throw new Error(`Unsupported monitor type "${type}". Supported: http, ping, port.`);
+  throw new Error(`Unsupported monitor type "${type}". Supported: http, ping, port, group.`);
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +255,8 @@ app.get('/monitors', (req, res) => {
     hostname: m.hostname || null,
     port: m.port || null,
     active: m.active !== undefined ? m.active : true,
+    parent: m.parent != null ? m.parent : null,
+    tags: Array.isArray(m.tags) ? m.tags : [],
   }));
   res.json(monitors);
 });
@@ -230,6 +292,107 @@ app.post('/monitors', (req, res) => {
       res.json({ ok: true, monitorID: result.monitorID, msg: result.msg });
     } else {
       res.status(422).json({ ok: false, error: (result && result.msg) || 'Kuma rejected the monitor (no message given).' });
+    }
+  });
+});
+
+app.delete('/monitors/:id', (req, res) => {
+  if (!loggedIn) {
+    return res.status(503).json({ ok: false, error: 'Not logged in to Kuma yet. Check /health and container logs.' });
+  }
+
+  const monitorID = Number(req.params.id);
+  if (!Number.isInteger(monitorID)) {
+    return res.status(400).json({ ok: false, error: '"id" must be a numeric monitor ID.' });
+  }
+
+  const deleteChildren =
+    req.query.deleteChildren === 'true' || (req.body && req.body.deleteChildren === true);
+
+  socket.emit('deleteMonitor', monitorID, deleteChildren, (result) => {
+    if (result && result.ok) {
+      res.json({ ok: true, msg: result.msg });
+    } else {
+      res.status(422).json({ ok: false, error: (result && result.msg) || 'Kuma rejected the delete (no message given).' });
+    }
+  });
+});
+
+app.get('/tags', (req, res) => {
+  if (!loggedIn) {
+    return res.status(503).json({ ok: false, error: 'Not logged in to Kuma yet. Check /health and container logs.' });
+  }
+
+  socket.emit('getTags', (result) => {
+    if (result && result.ok) {
+      res.json(result.tags);
+    } else {
+      res.status(500).json({ ok: false, error: (result && result.msg) || 'Failed to fetch tags (no message given).' });
+    }
+  });
+});
+
+app.post('/tags', (req, res) => {
+  if (!loggedIn) {
+    return res.status(503).json({ ok: false, error: 'Not logged in to Kuma yet. Check /health and container logs.' });
+  }
+
+  const { name, color } = req.body || {};
+  if (!name) {
+    return res.status(400).json({ ok: false, error: '"name" is required.' });
+  }
+
+  socket.emit('addTag', { name, color: color || '#00A5C0' }, (result) => {
+    if (result && result.ok) {
+      res.json({ ok: true, tag: result.tag });
+    } else {
+      res.status(422).json({ ok: false, error: (result && result.msg) || 'Kuma rejected the tag (no message given).' });
+    }
+  });
+});
+
+app.post('/monitors/:id/tags', (req, res) => {
+  if (!loggedIn) {
+    return res.status(503).json({ ok: false, error: 'Not logged in to Kuma yet. Check /health and container logs.' });
+  }
+
+  const monitorID = Number(req.params.id);
+  if (!Number.isInteger(monitorID)) {
+    return res.status(400).json({ ok: false, error: '"id" must be a numeric monitor ID.' });
+  }
+
+  const { tagID, value } = req.body || {};
+  if (!tagID) {
+    return res.status(400).json({ ok: false, error: '"tagID" is required.' });
+  }
+
+  socket.emit('addMonitorTag', tagID, monitorID, value != null ? value : '', (result) => {
+    if (result && result.ok) {
+      res.json({ ok: true, msg: result.msg });
+    } else {
+      res.status(422).json({ ok: false, error: (result && result.msg) || 'Kuma rejected attaching the tag (no message given).' });
+    }
+  });
+});
+
+app.delete('/monitors/:id/tags/:tagID', (req, res) => {
+  if (!loggedIn) {
+    return res.status(503).json({ ok: false, error: 'Not logged in to Kuma yet. Check /health and container logs.' });
+  }
+
+  const monitorID = Number(req.params.id);
+  const tagID = Number(req.params.tagID);
+  if (!Number.isInteger(monitorID) || !Number.isInteger(tagID)) {
+    return res.status(400).json({ ok: false, error: '"id" and "tagID" must both be numeric.' });
+  }
+
+  const value = (req.body && req.body.value) || (req.query && req.query.value) || '';
+
+  socket.emit('deleteMonitorTag', tagID, monitorID, value, (result) => {
+    if (result && result.ok) {
+      res.json({ ok: true, msg: result.msg });
+    } else {
+      res.status(422).json({ ok: false, error: (result && result.msg) || 'Kuma rejected removing the tag (no message given).' });
     }
   });
 });
