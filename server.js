@@ -125,7 +125,7 @@ function buildMonitorBean(input) {
     notificationIDList: DEFAULT_NOTIFICATION_ID ? { [DEFAULT_NOTIFICATION_ID]: true } : {},
     description: input.description || null,
     conditions: [],
-
+    accepted_statuscodes: [],
   };
 
   if (type === 'http') {
